@@ -1,21 +1,19 @@
 import logging
 import uuid
 from typing import Optional, Dict, Any
-
-from fastapi import APIRouter, Body, Depends, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Body, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from motor.motor_asyncio import AsyncIOMotorDatabase
 from db.session import get_db
-# Assuming FacebookPostResponse is defined somewhere, e.g., in models.facebook
-# from models.facebook import FacebookPostResponse # No longer directly used in Pydantic model for post_result
-from services.ai.post_workflow import post_graph, BrandingPostState
-from services.social_media.facebook_manager import create_facebook_post
-from pydantic import BaseModel
+from models.facebook import FacebookPostResponse # Assuming this model is defined
+from services.ai.post_workflow import post_graph, BrandingPostState # Assuming these are defined
+from pydantic import BaseModel, Field
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-initial_state_store = {}
-
+# --- Existing Models (adjust based on your actual models) ---
 class BrandSuggestionResponse(BaseModel):
     session_id: str
     brand_suggestions: str
@@ -27,7 +25,8 @@ class SelectBrandRequest(BaseModel):
 class ContentGenerationResponse(BaseModel):
     caption: str
     image_path: str
-    post_result: Optional[Dict[str, Any]] = None # Changed to Dict[str, Any] to accept a dictionary
+    post_result: Optional[FacebookPostResponse] = None
+# --- End Existing Models ---
 
 @router.websocket("/chat")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
@@ -43,21 +42,20 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
     except Exception as e:
         logger.error(f"WebSocket error for {client_id}: {e}", exc_info=True)
 
-
 @router.post("/generate-branding", response_model=BrandSuggestionResponse)
 async def generate_branding(
     agent_id: str = Body(..., description="Agent identifier"),
     prompt:   str = Body(..., description="Free-text prompt for AI"),
-    db = Depends(get_db)
+    db: AsyncIOMotorDatabase = Depends(get_db)
 ):
-    logger.info(f"AI→branding request for agent_id={agent_id}, prompt={prompt}")
-
+    logger.info(f"AI->branding request for agent_id={agent_id}, prompt={prompt}")
     session_id = str(uuid.uuid4())
 
+    # Initial state for the AI workflow graph
     initial_state: BrandingPostState = {
         "user_input": prompt,
         "client_id": agent_id,
-        "db": db,
+        "db": db, # The 'db' object is included here for the AI graph's internal use
         "brand_suggestions": None,
         "selected_brand": None,
         "visual_prompts": None,
@@ -73,36 +71,59 @@ async def generate_branding(
     }
 
     try:
+        # Invoke the AI graph to generate brand suggestions
         final_state = await post_graph.ainvoke(initial_state)
         brand_suggestions = final_state.get("brand_suggestions")
 
         if not brand_suggestions:
             raise HTTPException(status_code=500, detail="Failed to generate brand suggestions from AI.")
+        
+        # CRITICAL FIX: Convert FacebookPostResponse within final_state to a dictionary for BSON serialization
+        serializable_state = final_state.copy() # Create a mutable copy
 
-        initial_state_store[session_id] = final_state
-        logger.info(f"Generated brand suggestions for session {session_id}: {brand_suggestions[:100]}...")
+        # CRITICAL FIX: Remove the 'db' object before serialization
+        # The 'db' object is a live connection and cannot be serialized to MongoDB.
+        if "db" in serializable_state:
+            del serializable_state["db"]
+
+        # CRITICAL FIX: Explicitly include None values when dumping to dictionary
+        # This is for MongoDB persistence.
+        if serializable_state.get("post_result") and isinstance(serializable_state["post_result"], BaseModel):
+            serializable_state["post_result"] = serializable_state["post_result"].model_dump(exclude_none=False)
+
+        # Persist the full state to the 'sessions' collection
+        await db.sessions.insert_one({
+            "_id": session_id,
+            "state": serializable_state, # Use the serializable version
+            "created_at": datetime.utcnow()
+        })
+        logger.info(f"Generated brand suggestions for session {session_id} and persisted state.")
         return BrandSuggestionResponse(session_id=session_id, brand_suggestions=brand_suggestions)
 
     except Exception as e:
         logger.error(f"AI branding generation failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"AI workflow error during branding generation: {e}")
-
+        if "MotorCollection object is not callable" in str(e):
+             raise HTTPException(status_code=500, detail="Configuration Error: Database collection access is incorrect. Please ensure 'db/session.py' returns the database object and 'api/endpoints/bot.py' uses 'db.collection_name' to access collections.")
+        else:
+            raise HTTPException(status_code=500, detail=f"AI workflow error: {e}")
 
 @router.post("/continue-post-generation", response_model=ContentGenerationResponse)
 async def continue_post_generation(
     request: SelectBrandRequest,
-    db = Depends(get_db)
+    db: AsyncIOMotorDatabase = Depends(get_db)
 ):
     session_id = request.session_id
     selected_brand = request.selected_brand
+    logger.info(f"AI->continue post generation for session {session_id}")
 
-    logger.info(f"AI→continue post generation for session {session_id} with selected brand: {selected_brand[:50]}...")
-
-    current_state: Optional[BrandingPostState] = initial_state_store.pop(session_id, None)
-    if not current_state:
+    # Retrieve state from the database and delete it (one-time use session)
+    session_doc = await db.sessions.find_one_and_delete({"_id": session_id})
+    if not session_doc:
         raise HTTPException(status_code=404, detail="Session expired or not found. Please restart the process.")
 
-    current_state["selected_brand"] = selected_brand
+    current_state: BrandingPostState = session_doc["state"]
+    # CRITICAL FIX: Re-inject the db dependency for subsequent workflow steps
+    # The 'db' object was removed before persistence, so it must be re-added here.
     current_state["db"] = db
 
     try:
@@ -110,35 +131,37 @@ async def continue_post_generation(
 
         caption = final_state.get("base_post")
         image_path = final_state.get("image_path")
+        post_result = final_state.get("post_result") # This is expected to be a FacebookPostResponse instance
         
-        # FIX: Convert FacebookPostResponse object to a dictionary
-        raw_post_result = final_state.get("post_result")
-        processed_post_result = None
-        if raw_post_result:
-            # Assuming FacebookPostResponse has a .model_dump() or .dict() method
-            # If it's just a simple dataclass, you might need dataclasses.asdict()
-            if hasattr(raw_post_result, 'model_dump'):
-                processed_post_result = raw_post_result.model_dump()
-            elif hasattr(raw_post_result, 'dict'): # For Pydantic v1 or older versions
-                processed_post_result = raw_post_result.dict()
-            elif isinstance(raw_post_result, dict): # If it's already a dict
-                processed_post_result = raw_post_result
-            else:
-                # Fallback if it's some other object, might need more specific handling
-                processed_post_result = str(raw_post_result) # Convert to string if it's complex
-                logger.warning(f"Unexpected type for post_result: {type(raw_post_result)}. Converted to string.")
-        
+        # CRITICAL FIX: Remove the 'db' object from final_state before any potential re-serialization
+        # or if 'final_state' is used elsewhere for persistence.
+        if "db" in final_state:
+            del final_state["db"]
+
         if not caption or not image_path:
             raise HTTPException(status_code=500, detail="Failed to generate post content from AI.")
-
-        logger.info(f"Generated full post for session {session_id}. Caption: {caption[:100]}...")
+        
+        # Direct assignment: If post_result is already a FacebookPostResponse instance, use it directly.
+        # Pydantic's response_model will handle its serialization.
+        # If for some reason it's a dict, instantiate FacebookPostResponse from it.
+        final_facebook_post_response = None
+        if isinstance(post_result, FacebookPostResponse):
+            final_facebook_post_response = post_result
+        elif isinstance(post_result, dict):
+            # If it's a dict, instantiate FacebookPostResponse from it.
+            # Pydantic will handle Optional fields correctly if the key is missing or value is None.
+            final_facebook_post_response = FacebookPostResponse(**post_result)
+        
+        logger.info(f"Generated full post for session {session_id}.")
         return ContentGenerationResponse(
             caption=caption,
             image_path=image_path,
-            post_result=processed_post_result # Pass the processed dictionary here
+            post_result=final_facebook_post_response # Pass the correctly constructed instance
         )
 
     except Exception as e:
         logger.error(f"AI post generation failed for session {session_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"AI workflow error during post generation: {e}")
-
+        if "MotorCollection object is not callable" in str(e):
+             raise HTTPException(status_code=500, detail="Configuration Error: Database collection access is incorrect. Please ensure 'db/session.py' returns the database object and 'api/endpoints/bot.py' uses 'db.collection_name' to access collections.")
+        else:
+            raise HTTPException(status_code=500, detail=f"AI workflow error: {e}")

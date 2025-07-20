@@ -1,6 +1,8 @@
 import os
 import shutil
 import logging
+import httpx
+import base64
 from typing import TypedDict, List, Optional
 from PIL import Image, ImageDraw, ImageFont
 import asyncio
@@ -11,11 +13,15 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_groq import ChatGroq
 
 from services.social_media.facebook_manager import create_facebook_post
+from models.facebook import FacebookPostResponse, PostStatus
 from core.config import settings
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
 logger = logging.getLogger(__name__)
 
-# Initialize your LLM
+# -------------------------------
+# LLM Initialization
+# -------------------------------
 try:
     llm = ChatGroq(
         api_key=settings.GROQ_API_KEY,
@@ -25,13 +31,100 @@ try:
     logger.info("ChatGroq LLM initialized successfully.")
 except Exception as e:
     logger.error(f"ChatGroq initialization failed: {e}", exc_info=True)
-    llm = None # Ensure llm is None if initialization fails
+    llm = None
 
-# Define the state schema
+# -------------------------------
+# Stability AI Image Generation
+# -------------------------------
+async def generate_image_with_stability(prompt: str) -> bytes:
+    """Generate image using Stability AI API"""
+    api_key = settings.STABILITY_API_KEY
+    if not api_key:
+        raise ValueError("STABILITY_API_KEY is not set")
+
+    engine_id = "stable-diffusion-xl-1024-v1-0"
+    url = f"https://api.stability.ai/v1/generation/{engine_id}/text-to-image"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+    }
+
+    json_payload = {
+        "text_prompts": [{"text": prompt, "weight": 1.0}],
+        "cfg_scale": 7,
+        "height": 1024,
+        "width": 1024,
+        "samples": 1,
+        "steps": 30,
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(url, headers=headers, json=json_payload)
+        if response.status_code != 200:
+            raise Exception(f"Stability API request failed with status {response.status_code}: {response.text}")
+        data = response.json()
+
+        if data.get('artifacts') and len(data['artifacts']) > 0:
+            image_data = data['artifacts'][0]['base64']
+            return base64.b64decode(image_data)
+        else:
+            raise Exception("No image artifacts in response")
+
+# -------------------------------
+# Logo Generation
+# -------------------------------
+async def generate_agent_logo(agent_id: str, logo_prompt: str, db: AsyncIOMotorDatabase) -> str:
+    """Generate professional logo using AI and return its path"""
+    logo_dir = "generated_images"
+    os.makedirs(logo_dir, exist_ok=True)
+    
+    # Generate refined logo prompt
+    if llm:
+        prompt_template = ChatPromptTemplate.from_messages([
+            ("system", "You're a creative branding expert. Create a professional logo prompt for a real estate agent. Focus on visual elements: house icon, key, modern, clean, vector art, minimalistic. Include the agent's name if provided."),
+            ("user", "Brand concept: {logo_prompt_input}")
+        ])
+        chain = prompt_template | llm | StrOutputParser()
+        ai_logo_prompt = await chain.ainvoke({"logo_prompt_input": logo_prompt})
+        logger.info(f"[Logo] AI Prompt generated: {ai_logo_prompt[:100]}...")
+    else:
+        ai_logo_prompt = f"Professional real estate logo: {logo_prompt}, modern, clean, vector art"
+        logger.warning("[Logo] LLM not initialized, using generic prompt.")
+
+    # Generate logo image
+    logo_filename = f"{agent_id}_logo.png"
+    agent_logo_path = os.path.join(logo_dir, logo_filename)
+    
+    try:
+        image_bytes = await generate_image_with_stability(ai_logo_prompt)
+        with open(agent_logo_path, "wb") as f:
+            f.write(image_bytes)
+        logger.info(f"[Logo] AI logo generated: {agent_logo_path}")
+    except Exception as e:
+        logger.error(f"[Logo] AI generation failed: {e}. Using placeholder", exc_info=True)
+        # Fallback placeholder
+        img = Image.new("RGB", (512, 512), (30, 60, 90))
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("arial.ttf", 40)
+        except IOError:
+            font = ImageFont.load_default()
+        text = logo_prompt[:3].upper() if logo_prompt else "RE"
+        draw.text((150, 200), text, fill=(255, 255, 255), font=font)
+        img.save(agent_logo_path)
+    
+    return logo_filename
+
+
+
+# -------------------------------
+# State Definition (for LangGraph)
+# -------------------------------
 class BrandingPostState(TypedDict):
     user_input: Optional[str]
-    brand_suggestions: Optional[str] # Will contain all 3 initial suggestions
-    selected_brand: Optional[str]   # NEW: To store the user's chosen brand
+    brand_suggestions: Optional[str]
+    selected_brand: Optional[str]
     visual_prompts: Optional[str]
     image_path: Optional[str]
     location: Optional[str]
@@ -40,227 +133,258 @@ class BrandingPostState(TypedDict):
     features: List[str]
     base_post: Optional[str]
     missing_info: List[str]
-    post_result: Optional[dict]
+    post_result: Optional[FacebookPostResponse] 
     websocket: Optional[object]
     client_id: Optional[str]
-    db: Optional[object] # Add db to state if nodes need it
-    # New field to store the decision for routing
+    db: Optional[object]
     next_step_after_branding_decision: Optional[str]
+    logo_prompt: Optional[str]
+    logo_url: Optional[str]
 
-# Node: generate brand suggestions
+
+# -------------------------------
+# Node Functions (for LangGraph)
+# -------------------------------
 def create_branding_node(state: BrandingPostState) -> dict:
     if not llm:
-        logger.error("LLM not initialized, cannot create branding suggestions.")
-        return {"brand_suggestions": "Error: LLM not available."}
+        logger.error("LLM not initialized.")
+        return {"brand_suggestions": "Error: LLM unavailable."}
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You’re an expert real estate marketer. Generate 3 distinct brand name + slogan pairs, each on a new line. Format as 'Pair 1: Brand Name - Slogan\\nPair 2: Brand Name - Slogan'"), # Improved prompt for parsing
+        ("system", "You’re an expert real estate marketer. Generate 3 distinct brand name + slogan pairs. Format each line as 'Brand - Slogan'"),
         ("user", "Idea: {user_input}")
     ])
     chain = prompt | llm | StrOutputParser()
-    out = chain.invoke({"user_input": state["user_input"]})
-    logger.info(f"Generated brand suggestions: {out[:100]}...")
+    out = chain.invoke({"user_input": state.get("user_input", "")})
+    logger.info(f"[Branding] Suggestions: {out[:100]}...")
     return {"brand_suggestions": out.strip()}
 
-# Node: create a visual prompt
+
+async def generate_logo_prompt_node(state: BrandingPostState) -> dict:
+    # This node is part of the LangGraph flow, but the actual image generation
+    # is now handled by the standalone generate_agent_logo function.
+    # This node will just set the logo_prompt based on selected_brand.
+    brand = state.get("selected_brand", "Real Estate Co.")
+    logo_prompt_input = f"Logo for {brand}"
+    logger.info(f"[Logo Node] Setting logo prompt: {logo_prompt_input}")
+    return {"logo_prompt": logo_prompt_input}
+
+
+async def generate_logo_image_node(state: BrandingPostState) -> dict:
+    # This node now calls the standalone function
+    agent_id = state.get("client_id")
+    logo_prompt = state.get("logo_prompt")
+    db_conn = state.get("db") # Ensure db is passed from the graph state
+
+    if not agent_id or not logo_prompt or not db_conn:
+        logger.error("[Logo Node] Missing agent_id, logo_prompt, or db for logo generation.")
+        return {"logo_url": None} # Indicate failure
+
+    try:
+        logo_filename = await generate_agent_logo(agent_id, logo_prompt, db_conn)
+        return {"logo_url": logo_filename}
+    except Exception as e:
+        logger.error(f"[Logo Node] Error generating logo image: {e}", exc_info=True)
+        return {"logo_url": None}
+
+
 def create_visuals_node(state: BrandingPostState) -> dict:
     if not llm:
-        logger.error("LLM not initialized, cannot create visual prompts.")
-        return {"visual_prompts": "Error: LLM not available."}
+        logger.error("LLM not initialized.")
+        return {"visual_prompts": "Error: LLM unavailable."}
 
-    # Use selected_brand if available, otherwise fallback to brand_suggestions (shouldn't happen in multi-step)
     brand_context = state.get("selected_brand") or state.get("brand_suggestions")
     if not brand_context:
-        logger.warning("No brand context available for visual prompt generation.")
+        logger.warning("[Visuals] No brand context.")
         return {"visual_prompts": "No brand context."}
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You’re a creative director. Write a photorealistic image prompt. Focus on the core branding and property style."),
-        ("user", "Branding to inspire visuals: {brand_context}")
+        ("system", "You’re a creative director. Write a photorealistic image prompt for a real estate listing."),
+        ("user", "Brand inspiration: {brand_context}")
     ])
     chain = prompt | llm | StrOutputParser()
     out = chain.invoke({"brand_context": brand_context})
-    logger.info(f"Generated visual prompts: {out[:100]}...")
+    logger.info(f"[Visuals] Prompt: {out[:100]}...")
     return {"visual_prompts": out.strip()}
 
-# Node: simulate image generation (consider replacing with actual Stability AI call if available)
+
 def generate_image_node(state: BrandingPostState) -> dict:
     image_dir = "generated_images"
     os.makedirs(image_dir, exist_ok=True)
-    placeholder = "placeholder.png"
+    placeholder = "placeholder_post_image.png"
 
-    # Create placeholder image if it doesn't exist
     if not os.path.exists(placeholder):
         img = Image.new("RGB", (1024, 1024), (200, 200, 200))
-        d = ImageDraw.Draw(img)
+        draw = ImageDraw.Draw(img)
         try:
-            # Use a robust font loading strategy or ensure font exists
-            font_path = "arial.ttf" # Assuming arial.ttf is in the same directory or accessible
-            if not os.path.exists(font_path):
-                 # Fallback to default if arial.ttf is not found
-                font = ImageFont.load_default()
-                logger.warning(f"Font '{font_path}' not found, using default font.")
-            else:
-                font = ImageFont.truetype(font_path, 40)
-
-        except Exception as e:
+            font = ImageFont.truetype("arial.ttf", 40)
+        except Exception:
             font = ImageFont.load_default()
-            logger.error(f"Error loading font, using default: {e}", exc_info=True)
-        d.text((10, 10), "Placeholder Image", fill=(0, 0, 0), font=font)
+        draw.text((10, 10), "Placeholder Image", fill=(0, 0, 0), font=font)
         img.save(placeholder)
-        logger.info(f"Created new placeholder image at {placeholder}")
+        logger.info("[Image] Placeholder created.")
 
-    out_path = os.path.join(image_dir, f"{state.get('client_id', 'unknown_agent')}_img.png")
-    shutil.copy(placeholder, out_path)
-    logger.info(f"Generated placeholder image at {out_path}")
-    return {"image_path": out_path}
+    image_filename = f"{state.get('client_id', 'agent')}_post_image.png"
+    image_path = os.path.join(image_dir, image_filename)
+    shutil.copy(placeholder, image_path)
+    return {"image_path": image_filename}
 
-# Node: check for required property info
+
 def check_requirements_node(state: BrandingPostState) -> dict:
-    missing = []
-    # Using .get() with a default value prevents KeyError if a key is truly absent
-    for key in ("location", "price", "bedrooms", "features"):
-        if not state.get(key):
-            missing.append(key)
-    logger.info(f"Missing info: {missing}")
+    required = ["location", "price", "bedrooms", "features"]
+    missing = [key for key in required if not state.get(key)]
+    logger.info(f"[Check] Missing: {missing}")
     return {"missing_info": missing}
 
-# Node: generate the Facebook post copy
+
 def generate_post_node(state: BrandingPostState) -> dict:
     if not llm:
-        logger.error("LLM not initialized, cannot generate post copy.")
-        return {"base_post": "Error: LLM not available."}
+        return {"base_post": "Error: LLM unavailable."}
 
-    # Use selected_brand if available, otherwise fallback
-    brand_context = state.get("selected_brand") or state.get("brand_suggestions")
-    if not brand_context:
-        logger.warning("No brand context available for post generation.")
-        return {"base_post": "No brand context."}
+    brand = state.get("selected_brand") or state.get("brand_suggestions", "")
+    args = {
+        "location": state.get("location", "undisclosed"),
+        "price": state.get("price", "undisclosed"),
+        "bedrooms": state.get("bedrooms", "undisclosed"),
+        "features": ", ".join(state.get("features", ["none listed"])),
+        "brand_context": brand
+    }
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You’re a world-class real estate copywriter. Write a Facebook post with emojis & CTA."),
-        ("user",
-         "Property at {location}, price {price}, {bedrooms} beds, features: {features}. "
-         "Use branding: {brand_context}") # Use brand_context here
+        ("system", "You’re a world-class real estate copywriter. Write a Facebook post with emojis and a clear CTA."),
+        ("user", "Property at {location}, price {price}, {bedrooms} beds. Features: {features}. Branding: {brand_context}")
     ])
     chain = prompt | llm | StrOutputParser()
-    args = {
-        "location": state.get("location", "an undisclosed location"), # Use .get with defaults
-        "price": state.get("price", "an undisclosed price"),
-        "bedrooms": state.get("bedrooms", "an undisclosed number of"),
-        "features": ", ".join(state.get("features", ["no specific features"])),
-        "brand_context": brand_context, # Pass the selected/generated brand
-    }
     out = chain.invoke(args)
-    logger.info(f"Generated post copy: {out[:100]}...")
+    logger.info(f"[Post] Caption: {out[:100]}...")
     return {"base_post": out.strip()}
 
-# Node: post to Facebook via your manager
-async def post_to_facebook_node(state: BrandingPostState) -> dict:
-    caption = state.get("base_post")
-    image_path = state.get("image_path")
-    agent_id = state.get("client_id")
-    db_session = state.get("db") # Access db from the state if passed
 
-    if not caption or not agent_id:
-        logger.error("Cannot post to Facebook: Missing caption or agent ID.")
-        return {"post_result": {"status": "failed", "message": "Missing required data for Facebook post."}}
+async def post_to_facebook_node(state: BrandingPostState) -> dict:
+    agent_id = state.get("client_id")
+    caption = state.get("base_post")
+    image_path_from_state = state.get("image_path") # This is now just the filename
+    db_conn = state.get("db")
+
+    # Construct full image URL if image_path exists for Facebook upload
+    full_image_url = f"/generated_images/{image_path_from_state}" if image_path_from_state else None
+    
+    post_id = "N/A"
+    post_url = None
+    status = PostStatus.FAILED
+    error_message = None
 
     try:
+        # Pass the full image URL to create_facebook_post
         fb_resp = await create_facebook_post(
             agent_id=agent_id,
             caption=caption,
-            images=[image_path] if image_path else [],
-            db=db_session # Pass the db session here
+            images=[full_image_url] if full_image_url else [], # Pass the full URL
+            db=db_conn
         )
-        logger.info(f"Posted to Facebook, got: {fb_resp}")
-        return {"post_result": fb_resp}
+        if isinstance(fb_resp, FacebookPostResponse):
+            post_id = fb_resp.post_id
+            post_url = fb_resp.url
+            status = fb_resp.status
+            error_message = fb_resp.error
+            logger.info(f"[Facebook] Post created successfully: {post_id}")
+        else:
+            error_message = f"Unexpected response from Facebook post creation: {fb_resp}"
+            logger.error(f"[Facebook] {error_message}")
+
     except Exception as e:
-        logger.error(f"Failed to post to Facebook from graph node: {e}", exc_info=True)
-        return {"post_result": {"status": "failed", "message": f"Facebook posting error: {e}"}}
+        error_message = str(e)
+        logger.error(f"[Facebook] Error creating post: {error_message}", exc_info=True)
+    
+    return_post_result = FacebookPostResponse(
+        agent_id=agent_id,
+        post_id=post_id,
+        message=caption,
+        url=post_url,
+        status=status,
+        error=error_message,
+        ai_generated=True,
+        image_path=image_path_from_state # Store just the filename in the DB
+    )
+    return {"post_result": return_post_result}
 
 
-# NEW NODE: Decision node for branding. It MUST return a dict.
+# -------------------------------
+# Routing Logic
+# -------------------------------
 def branding_decision_node(state: BrandingPostState) -> dict:
-    """
-    Determines whether to proceed to create visuals (if brand selected)
-    or generate branding suggestions (if no brand selected).
-    Returns a dict that sets 'next_step_after_branding_decision' in the state.
-    """
-    if state.get("selected_brand"):
-        logger.info("Brand selected, setting next step to 'create_visuals'.")
-        return {"next_step_after_branding_decision": "create_visuals"}
-    else:
-        logger.info("No brand selected, setting next step to 'create_branding'.")
-        return {"next_step_after_branding_decision": "create_branding"}
+    next_step = "generate_logo_prompt" if state.get("selected_brand") else "create_branding"
+    logger.info(f"[Decision] Next: {next_step}")
+    return {"next_step_after_branding_decision": next_step}
 
-# NEW ROUTING FUNCTION: This function will be called by conditional_edges
-# to read the decision from the state (set by branding_decision_node).
+
 def route_after_branding(state: BrandingPostState) -> str:
-    """Reads the 'next_step_after_branding_decision' from state to route."""
     return state.get("next_step_after_branding_decision", "create_branding")
 
 
-# Decision: all info present?
 def decide_after_requirements(state: BrandingPostState) -> str:
-    # Ensure missing_info is a list to prevent errors
-    if not state.get("missing_info"):
-        logger.info("All property info present, proceeding to generate post.")
-        return "generate_post"
-    logger.info("Missing property info, pausing for input.")
-    return "pause_for_input"
+    return "generate_post" if not state.get("missing_info") else "pause_for_input"
 
-# Build and compile the graph
+
+# -------------------------------
+# Graph Definition
+# -------------------------------
 def build_post_graph():
-    if not llm:
-        logger.error("LLM is None, graph cannot be compiled fully.")
-
     g = StateGraph(BrandingPostState)
 
-    # Add nodes
-    g.add_node("branding_decision_node", branding_decision_node) # NEW: Add the decision node
-    g.add_node("create_branding",     create_branding_node)
-    g.add_node("create_visuals",      create_visuals_node)
-    g.add_node("generate_image",      generate_image_node)
-    g.add_node("check_requirements",  check_requirements_node)
-    g.add_node("generate_post",       generate_post_node)
-    g.add_node("post_to_facebook",    post_to_facebook_node)
-    g.add_node("pause_for_input",     lambda s: {})
-
-    # Set entry point to the new decision node
     g.set_entry_point("branding_decision_node")
+    g.add_node("branding_decision_node", branding_decision_node)
+    g.add_node("create_branding", create_branding_node)
+    g.add_node("generate_logo_prompt", generate_logo_prompt_node)
+    g.add_node("generate_logo_image", generate_logo_image_node)
+    g.add_node("create_visuals", create_visuals_node)
+    g.add_node("generate_image", generate_image_node)
+    g.add_node("check_requirements", check_requirements_node)
+    g.add_node("generate_post", generate_post_node)
+    g.add_node("post_to_facebook", post_to_facebook_node)
+    g.add_node("pause_for_input", lambda s: {}) 
 
-    # Conditional edges from the branding_decision_node
+    # Conditional transitions from branding decision
     g.add_conditional_edges(
-        "branding_decision_node", # Source node is the decision node
-        route_after_branding,     # This function reads the decision from state
+        "branding_decision_node",
+        route_after_branding,
         {
             "create_branding": "create_branding",
-            "create_visuals": "create_visuals"
+            "generate_logo_prompt": "generate_logo_prompt"
         }
     )
 
-    # Standard flow after branding (either generated or selected)
-    g.add_edge("create_branding", "create_visuals") # After generating brands, proceed to visuals
-    g.add_edge("create_visuals",  "generate_image")
-    g.add_edge("generate_image",  "check_requirements")
+    # Logo flow
+    g.add_edge("create_branding", "generate_logo_prompt")
+    g.add_edge("generate_logo_prompt", "generate_logo_image")
+    g.add_edge("generate_logo_image", "create_visuals")
 
+    # Visual flow
+    g.add_edge("create_visuals", "generate_image")
+    g.add_edge("generate_image", "check_requirements")
+
+    # Info check & routing
     g.add_conditional_edges(
         "check_requirements",
         decide_after_requirements,
-        {"generate_post":"generate_post", "pause_for_input":"pause_for_input"}
+        {
+            "generate_post": "generate_post",
+            "pause_for_input": "pause_for_input"
+        }
     )
-    g.add_edge("pause_for_input","generate_post") # After pause (e.g., getting missing info), proceed to generate post
-    g.add_edge("generate_post","post_to_facebook")
+
+    g.add_edge("pause_for_input", "generate_post")
+    g.add_edge("generate_post", "post_to_facebook")
     g.add_edge("post_to_facebook", END)
 
     logger.info("LangGraph post_graph compiled.")
     return g.compile()
 
-# Instantiate once
+
+# Initialize graph safely
 try:
     post_graph = build_post_graph()
 except RuntimeError as e:
     logger.critical(f"Failed to build post_graph: {e}")
-    post_graph = None # Ensure it's None if compilation fails
+    post_graph = None
 

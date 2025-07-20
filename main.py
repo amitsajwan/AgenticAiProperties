@@ -1,35 +1,28 @@
 import asyncio
 import logging
 import os
-import json # [ADDED]
-from fastapi import FastAPI, Request
+import json
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-
+from starlette.responses import FileResponse, Response
 from core.config import settings
-
-# --- Import all necessary routers ---
-from api.endpoints.facebook.auth import router as auth_router, clean_expired_tokens
-from api.endpoints.facebook.posts import router as posts_router
-from api.endpoints.facebook.status import router as status_router
-from api.endpoints.facebook.insights import router as insights_router
-from api.endpoints.facebook.webhooks import router as webhooks_router
-from api.endpoints.bot import router as bot_router
-from api.endpoints.agent_website import router as website_router
-
-# Initialize logging 
 from logging_config import configure_logging
+
+# --- Configure Logging ---
 configure_logging()
-
-
 logger = logging.getLogger(__name__)
-# --- Static Files Configuration ---
-IMAGES_DIR = "generated_images"
-if not os.path.exists(IMAGES_DIR):
-    os.makedirs(IMAGES_DIR)
-    logger.info(f"Created image directory: {IMAGES_DIR}")
 
-# Create FastAPI app
+# --- Constants for Directories ---
+IMAGES_DIR = "generated_images"
+AGENT_SITE_V2_DIR = os.path.abspath("agent_sites_v2") # Use absolute path for clarity
+
+# --- Ensure Directories Exist ---
+for path in [IMAGES_DIR, AGENT_SITE_V2_DIR]:
+    os.makedirs(path, exist_ok=True)
+    logger.info(f"Ensured directory exists: {path}")
+
+# --- FastAPI App ---
 app = FastAPI(
     title="Agentic AI Properties",
     description="Platform for real estate agent branding and content publishing",
@@ -37,83 +30,90 @@ app = FastAPI(
 )
 
 # -------------------
-# Logging Middleware
+# Middleware: Logging & CORS
 # -------------------
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    origin = request.headers.get("origin")
-    upgrade = request.headers.get("upgrade", "").lower()
-    if upgrade == "websocket":
-        logger.info(f"WebSocket handshake origin: {origin!r}")
-
     logger.info(f"--> {request.method} {request.url}")
-    if request.method != "GET" and upgrade != "websocket":
-        try:
-            body = await request.body()
-            # Log only first 500 chars to prevent overly large logs
-            logger.info(f"    Body: {body.decode(errors='ignore')[:500]}{'...' if len(body) > 500 else ''}")
-        except Exception:
-            # Handle cases where body might not be readable (e.g., streaming)
-            pass
-
     response = await call_next(request)
     logger.info(f"<-- {response.status_code} {request.url.path}")
     return response
 
-# -----
-# CORS
-# -----
-# For production, you should revert this to specific origins from settings.CORS_ALLOWED_ORIGINS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # <--- Set to "*" for debugging
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Mount Static Files ---
-# This allows you to access images via http://localhost:8000/generated_images/image.png
+# ---------------------
+# Mount Static Folder for Generated Images
+# ---------------------
 app.mount("/generated_images", StaticFiles(directory=IMAGES_DIR), name="static_images")
 
+# -----------------------
+# Startup & Shutdown Hooks
+# -----------------------
+# Assuming clean_expired_tokens is in api.endpoints.facebook.auth
+from api.endpoints.facebook.auth import clean_expired_tokens 
 
-# --------------------
-# Startup & Shutdown
-# --------------------
 @app.on_event("startup")
 async def on_startup():
     logger.info("Application startup initiated.")
-    # Start the background task for cleaning expired OAuth state tokens
     asyncio.create_task(clean_expired_tokens())
     logger.info("Application startup complete.")
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    logger.info("Application shutdown initiated.")
     logger.info("Application shutdown complete.")
 
-# -------------
-# Health Check
-# -------------
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy"}
+# ----------------
+# API Routers
+# ----------------
+from api.endpoints.facebook.auth import router as auth_router
+from api.endpoints.facebook.facebook import router as facebook_router
+from api.endpoints.facebook.insights import router as insights_router
+from api.endpoints.facebook.webhooks import router as webhooks_router
+from api.endpoints.bot import router as bot_router
+from api.endpoints.agent_website import router as website_router
 
-# ---------------
-# Include Routers
-# ---------------
-# API routers are included with their respective prefixes
-app.include_router(auth_router, prefix="/api/facebook/auth", tags=["Facebook Authentication"])
-app.include_router(status_router, prefix="/api/facebook/status", tags=["Facebook Status"])
-app.include_router(posts_router, prefix="/api/facebook", tags=["Facebook Posts"]) # Note: prefix is /api/facebook, so endpoint is /api/facebook/posts
+app.include_router(auth_router,     prefix="/api/facebook/auth",     tags=["Facebook Authentication"])
+app.include_router(facebook_router, prefix="/api/facebook",          tags=["Facebook"])
 app.include_router(insights_router, prefix="/api/facebook/insights", tags=["Facebook Insights"])
 app.include_router(webhooks_router, prefix="/api/facebook/webhooks", tags=["Facebook Webhooks"])
-app.include_router(bot_router, prefix="/api/bot", tags=["AI Bot"])
-app.include_router(website_router, prefix="/api/agents", tags=["Agent Websites"])
+app.include_router(bot_router,      prefix="/api/bot",               tags=["AI Bot"])
+app.include_router(website_router,  prefix="/api/agents",            tags=["Agent Websites"])
 
-from api.endpoints.facebook import status as facebook_status_router
+# ---------------------------------------------------------------------------------
+# CATCH-ALL ROUTE for Agent Websites (Replaces app.mount for better control)
+# This route must be LAST, after all other API routes are defined.
+# ---------------------------------------------------------------------------------
+@app.get("/{full_path:path}")
+async def serve_agent_site(full_path: str):
+    """
+    Safely serves static files for agent websites.
+    - It maps URL paths to the 'agent_sites_v2' directory.
+    - If a path is a directory, it looks for an 'index.html' inside it.
+    - Returns a 404 error if the file is not found, preventing security risks.
+    """
+    # Prevent path traversal attacks
+    if ".." in full_path:
+        raise HTTPException(status_code=404, detail="Not Found")
 
-app.include_router(facebook_status_router.router, prefix="/api/facebook", tags=["Facebook"])
+    # Construct the full path to the requested file
+    file_path = os.path.join(AGENT_SITE_V2_DIR, full_path)
 
+    # If the path points to a directory, try to serve its index.html
+    if os.path.isdir(file_path):
+        index_path = os.path.join(file_path, "index.html")
+        if os.path.isfile(index_path):
+            return FileResponse(index_path)
+    
+    # If the path is a file and it exists, serve it
+    elif os.path.isfile(file_path):
+        return FileResponse(file_path)
 
-
+    # Otherwise, the file does not exist
+    logger.warning(f"Static file not found: {file_path}")
+    raise HTTPException(status_code=404, detail="Not Found")

@@ -1,209 +1,264 @@
-# services/social_media/facebook_manager.py
-
-import os
-import httpx
 import logging
-import datetime
+import os
 from typing import List, Optional, Dict, Any
+import httpx
+from fastapi import HTTPException
 from pydantic import BaseModel, Field
+from datetime import datetime
 from enum import Enum
-from fastapi import HTTPException, Depends
-from services.social_media.token_service import FacebookTokenService
-from db.session import get_db
+
+from core.config import settings
+from services.social_media.token_service import FacebookTokenService, get_token_service
+from fastapi import Depends
+from motor.motor_asyncio import AsyncIOMotorDatabase # Import AsyncIOMotorDatabase
+from db.session import get_db # Import get_db
 
 logger = logging.getLogger(__name__)
 
-# Corrected PostStatus Enum
+# --- Re-defining PostStatus and FacebookPostResponse for clarity in this file
+#     These should ideally be imported from models/facebook.py
 class PostStatus(str, Enum):
-    PUBLISHED = "published"
+    DRAFT = "draft"
     SCHEDULED = "scheduled"
+    PUBLISHED = "published"
     FAILED = "failed"
-    PENDING = "pending" # For internal workflow status
+    DELETED = "deleted"
 
-# Define FacebookPostResponse Model
 class FacebookPostResponse(BaseModel):
-    post_id: str
-    message: str
-    url: Optional[str] = None
+    post_id: str = Field(..., description="Facebook's unique post identifier")
+    message: str = Field(..., max_length=5000, description="Post content text")
+    url: Optional[str] = Field(None, description="Permalink to the post on Facebook")
     agent_id: str
-    created_at: datetime.datetime = Field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
-    updated_at: Optional[datetime.datetime] = None
-    status: PostStatus = PostStatus.PENDING
-    engagement: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
-    scheduled_time: Optional[datetime.datetime] = None
-    ai_generated: bool = False
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: Optional[datetime] = None
+    status: PostStatus = Field(PostStatus.PUBLISHED)
+    engagement: Optional[Dict[str, int]] = Field(None, description="Likes, comments, shares counts")
+    error: Optional[str] = Field(None, description="Error details if status=failed")
+    scheduled_time: Optional[datetime] = None
+    ai_generated: bool = Field(False)
+    image_path: Optional[str] = Field(None, description="Path to the generated image for the post") # Ensure this is here
+
+# --- End re-definitions ---
 
 
 async def create_facebook_post(
     agent_id: str,
     caption: str,
-    images: List[str],
-    db = Depends(get_db),
-    scheduled_time: Optional[datetime.datetime] = None
+    images: Optional[List[str]] = None, # Expects full URLs or paths that can be resolved
+    scheduled_time: Optional[datetime] = None,
+    db: AsyncIOMotorDatabase = Depends(get_db) # CRITICAL FIX: Use Depends(get_db)
 ) -> FacebookPostResponse:
+    """
+    Creates and publishes a Facebook post for a given agent.
+    Can include up to 4 images.
+    """
     logger.info(f"Attempting to create Facebook post for agent {agent_id}.")
+    token_service = FacebookTokenService(db) # Initialize service with the db
 
-    token_service = FacebookTokenService(db)
-    
-    page_id = None
-    access_token = None
-
+    # 1. Retrieve page access token
     try:
         page_data = await token_service.get_page_token_for_agent(agent_id)
         page_id = page_data.page_id
-        access_token = page_data.access_token
+        page_access_token = page_data.access_token
         logger.info(f"Successfully retrieved page token for page ID: {page_id}")
-
     except HTTPException as e:
-        logger.error(f"Failed to retrieve Facebook credentials for agent {agent_id}: {e.detail}", exc_info=True)
+        logger.error(f"Failed to retrieve Facebook credentials for agent {agent_id}: {e.detail}")
         return FacebookPostResponse(
+            agent_id=agent_id,
             post_id="N/A",
             message=caption,
-            agent_id=agent_id,
+            url=None,
             status=PostStatus.FAILED,
-            error=f"Failed to retrieve Facebook credentials: {e.detail}"
+            error=f"Failed to retrieve Facebook credentials: {e.detail}",
+            ai_generated=True,
+            image_path=images[0] if images else None # Pass original image path if available
         )
     except Exception as e:
         logger.error(f"Unexpected error retrieving Facebook credentials for agent {agent_id}: {e}", exc_info=True)
         return FacebookPostResponse(
+            agent_id=agent_id,
             post_id="N/A",
             message=caption,
-            agent_id=agent_id,
+            url=None,
             status=PostStatus.FAILED,
-            error=f"Unexpected error retrieving Facebook credentials: {e}"
+            error=f"Unexpected error retrieving Facebook credentials: {str(e)}",
+            ai_generated=True,
+            image_path=images[0] if images else None
         )
 
-    base_url = f"https://graph.facebook.com/{os.getenv('FB_API_VERSION', 'v19.0')}"
+    post_url = f"https://graph.facebook.com/v19.0/{page_id}/photos" # For image posts
+    
+    # Prepare files for upload
+    files = {}
+    attached_media_ids = []
+    
+    # CRITICAL FIX: Get the base directory of the backend project
+    # This assumes facebook_manager.py is in services/social_media
+    backend_base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    generated_images_dir = os.path.join(backend_base_dir, "generated_images")
 
-    # 1. Upload images (if any)
-    media_ids = []
-    for image_path in images:
-        absolute_image_path = os.path.abspath(image_path)
-        logger.info(f"Attempting to open image from absolute path: {absolute_image_path}")
+    # [NEW] Add debug logs for paths
+    logger.debug(f"DEBUG: backend_base_dir: {backend_base_dir}")
+    logger.debug(f"DEBUG: generated_images_dir: {generated_images_dir}")
 
-        try:
-            with open(absolute_image_path, "rb") as file_obj:
-                files = {"source": file_obj}
-                # Upload to /photos endpoint with published=false to get a media_id
-                upload_url = f"{base_url}/{page_id}/photos?access_token={access_token}&published=false"
-                async with httpx.AsyncClient() as client:
-                    upload_response = await client.post(upload_url, files=files)
-                    upload_response.raise_for_status()
-                    media_id = upload_response.json().get("id")
-                    if media_id:
-                        media_ids.append(media_id)
-                        logger.info(f"Image uploaded with media ID: {media_id}")
-                    else:
-                        logger.error(f"Image upload failed, no media ID: {upload_response.text}")
-                        return FacebookPostResponse(
-                            post_id="N/A",
-                            message=caption,
-                            agent_id=agent_id,
-                            status=PostStatus.FAILED,
-                            error=f"Image upload failed: {upload_response.text}"
-                        )
-        except FileNotFoundError:
-            logger.error(f"Image file not found at {absolute_image_path}. This image will not be included.", exc_info=True)
-            return FacebookPostResponse(
-                post_id="N/A",
-                message=caption,
-                agent_id=agent_id,
-                status=PostStatus.FAILED,
-                error=f"Image file not found: {absolute_image_path}"
-            )
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Error uploading image to Facebook: {e.response.text}", exc_info=True)
-            return FacebookPostResponse(
-                post_id="N/A",
-                message=caption,
-                agent_id=agent_id,
-                status=PostStatus.FAILED,
-                error=f"Facebook API Error (Image Upload): {e.response.text}"
-            )
-        except Exception as e:
-            logger.error(f"Unexpected error during image upload: {e}", exc_info=True)
-            return FacebookPostResponse(
-                post_id="N/A",
-                message=caption,
-                agent_id=agent_id,
-                status=PostStatus.FAILED,
-                error=f"Unexpected error during image upload: {e}"
-            )
 
-    # 2. Create the post
-    # For publishing with attached media, always use the /feed endpoint.
-    post_url = f"{base_url}/{page_id}/feed"
-    post_data = {"message": caption, "access_token": access_token}
+    if images:
+        for i, img_path_relative in enumerate(images):
+            # Assuming img_path_relative is just the filename (e.g., "amit_post_image.png")
+            # The AI workflow returns just the filename, so we need to construct the full path.
+            image_filename = os.path.basename(img_path_relative) # Ensure it's just the filename
+            absolute_image_path = os.path.join(generated_images_dir, image_filename)
 
-    if media_ids:
-        # Attach media_ids for the post. For single image, it's just one item.
-        # For multiple, Facebook treats them as a multi-photo post if the page supports it.
-        attached_media_list = []
-        for i, media_id in enumerate(media_ids):
-            attached_media_list.append({"media_fbid": media_id})
-        
-        # When sending multiple attached_media, it should be an array of objects
-        # or use attached_media[0], attached_media[1] for form data.
-        # httpx typically handles list of dicts for `json` parameter or `data` for form fields.
-        # For `x-www-form-urlencoded` or `multipart/form-data`, you'd typically send:
-        # attached_media[0][media_fbid]=MEDIA_ID_1&attached_media[1][media_fbid]=MEDIA_ID_2
-        # Let's ensure it's sent as a form field.
-        for i, media_obj in enumerate(attached_media_list):
-            post_data[f"attached_media[{i}]"] = media_obj # This should correctly format for form data
-
-    if scheduled_time:
-        post_data["scheduled_publish_time"] = int(scheduled_time.timestamp())
-        post_data["published"] = False
-        post_status = PostStatus.SCHEDULED
-    else:
-        post_status = PostStatus.PUBLISHED
-
-    try:
-        async with httpx.AsyncClient() as client:
-            # Send as data (form-urlencoded or multipart)
-            final_post_response = await client.post(post_url, data=post_data)
-            final_post_response.raise_for_status()
-            post_response_data = final_post_response.json()
-            post_id = post_response_data.get("id") or post_response_data.get("post_id")
-
-            if post_id:
-                post_url_fb = f"https://facebook.com/{post_id}"
-                logger.info(f"Post successful! Post ID: {post_id}, URL: {post_url_fb}")
+            logger.info(f"Attempting to open image from absolute path: {absolute_image_path}")
+            if not os.path.exists(absolute_image_path):
+                logger.error(f"Image file not found at {absolute_image_path}. This image will not be included.")
+                # Continue without this image, or raise an error if images are mandatory
+                # Returning a failed post response here as image is critical for this flow
                 return FacebookPostResponse(
-                    post_id=post_id,
-                    message=caption,
-                    url=post_url_fb,
                     agent_id=agent_id,
-                    status=post_status,
-                    ai_generated=True
-                )
-            else:
-                logger.error(f"Post successful but no post ID returned: {final_post_response.text}")
-                return FacebookPostResponse(
                     post_id="N/A",
                     message=caption,
-                    agent_id=agent_id,
+                    url=None,
                     status=PostStatus.FAILED,
-                    error=f"Post successful but no post ID: {final_post_response.text}"
+                    error=f"Image file not found: {absolute_image_path}",
+                    ai_generated=True,
+                    image_path=images[0] if images else None
                 )
+            
+            try:
+                # Upload image first to get an attached_media ID
+                upload_url = f"https://graph.facebook.com/v19.0/{page_id}/photos"
+                upload_params = {
+                    "access_token": page_access_token,
+                    "published": False # Upload but don't publish yet
+                }
+                with open(absolute_image_path, "rb") as file_obj:
+                    upload_files = {"source": file_obj}
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        upload_resp = await client.post(upload_url, params=upload_params, files=upload_files)
+                        upload_resp.raise_for_status()
+                        upload_data = upload_resp.json()
+                        attached_media_ids.append({"media_fbid": upload_data["id"]})
+                        logger.info(f"Image uploaded, media ID: {upload_data['id']}")
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Facebook image upload failed: {e.response.status_code} - {e.response.text}", exc_info=True)
+                # If image upload fails, log and continue without images or mark post as failed
+                return FacebookPostResponse(
+                    agent_id=agent_id,
+                    post_id="N/A",
+                    message=caption,
+                    url=None,
+                    status=PostStatus.FAILED,
+                    error=f"Facebook image upload failed: {e.response.text}",
+                    ai_generated=True,
+                    image_path=images[0] if images else None
+                )
+            except Exception as e:
+                logger.error(f"Error during image upload: {e}", exc_info=True)
+                return FacebookPostResponse(
+                    agent_id=agent_id,
+                    post_id="N/A",
+                    message=caption,
+                    url=None,
+                    status=PostStatus.FAILED,
+                    error=f"Error during image upload: {str(e)}",
+                    ai_generated=True,
+                    image_path=images[0] if images else None
+                )
+    
+    # Prepare post parameters
+    post_params = {
+        "message": caption,
+        "access_token": page_access_token,
+    }
+
+    if attached_media_ids:
+        post_params["attached_media"] = attached_media_ids
+        post_url = f"https://graph.facebook.com/v19.0/{page_id}/feed" # For multi-image posts, use /feed endpoint
+
+    if scheduled_time:
+        post_params["scheduled_publish_time"] = int(scheduled_time.timestamp())
+        post_params["published"] = False # Must be false for scheduled posts
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            logger.info(f"Attempting to publish post to Facebook for page ID: {page_id}")
+            response = await client.post(post_url, json=post_params) # Use json for attached_media
+            response.raise_for_status()
+            post_data = response.json()
+            logger.info(f"Facebook post successful. Post ID: {post_data.get('id')}")
+
+            # Fetch permalink
+            permalink = None
+            if post_data.get("id"):
+                permalink_url = f"https://graph.facebook.com/v19.0/{post_data['id']}"
+                permalink_params = {"fields": "permalink_url", "access_token": page_access_token}
+                permalink_resp = await client.get(permalink_url, params=permalink_params)
+                permalink_resp.raise_for_status()
+                permalink_data = permalink_resp.json()
+                permalink = permalink_data.get("permalink_url")
+                logger.info(f"Facebook post permalink: {permalink}")
+
+            return FacebookPostResponse(
+                agent_id=agent_id,
+                post_id=post_data.get("id", "N/A"),
+                message=caption,
+                url=permalink,
+                status=PostStatus.PUBLISHED if not scheduled_time else PostStatus.SCHEDULED,
+                ai_generated=True,
+                image_path=images[0] if images else None # Store the original relative image path
+            )
 
     except httpx.HTTPStatusError as e:
-        logger.error(f"Error creating Facebook post: {e.response.text}", exc_info=True)
+        logger.error(f"Facebook API error during post creation: {e.response.status_code} - {e.response.text}", exc_info=True)
         return FacebookPostResponse(
+            agent_id=agent_id,
             post_id="N/A",
             message=caption,
-            agent_id=agent_id,
+            url=None,
             status=PostStatus.FAILED,
-            error=f"Facebook API Error (Post Creation): {e.response.text}"
+            error=f"Facebook API error: {e.response.text}",
+            ai_generated=True,
+            image_path=images[0] if images else None
         )
     except Exception as e:
         logger.error(f"Unexpected error during Facebook post creation: {e}", exc_info=True)
         return FacebookPostResponse(
+            agent_id=agent_id,
             post_id="N/A",
             message=caption,
-            agent_id=agent_id,
+            url=None,
             status=PostStatus.FAILED,
-            error=f"Unexpected error during Facebook post creation: {e}"
+            error=f"Unexpected error: {str(e)}",
+            ai_generated=True,
+            image_path=images[0] if images else None
         )
 
+# This function is not used in the current flow but might be for fetching existing posts
+async def get_facebook_posts(page_id: str, access_token: str) -> List[dict]:
+    url = f"https://graph.facebook.com/v19.0/{page_id}/posts"
+    params = {"access_token": access_token, "fields": "id,message,created_time,full_picture,permalink_url,shares,comments.summary(true),reactions.summary(true)"}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            posts = []
+            for item in data.get("data", []):
+                posts.append({
+                    "id": item.get("id"),
+                    "message": item.get("message"),
+                    "created_time": item.get("created_time"),
+                    "full_picture": item.get("full_picture"),
+                    "permalink_url": item.get("permalink_url"),
+                    "shares": item.get("shares", {}).get("count", 0),
+                    "comments": item.get("comments", {}).get("summary", {}).get("total_count", 0),
+                    "likes": item.get("reactions", {}).get("summary", {}).get("total_count", 0),
+                })
+            return posts
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Facebook API error fetching posts: {e.response.status_code} - {e.response.text}")
+        return []
+    except Exception as e:
+        logger.error(f"Failed to fetch Facebook posts: {e}", exc_info=True)
+        return []

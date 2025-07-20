@@ -20,7 +20,7 @@ const getWebSocketURL = () => {
     // Assumes backend runs on port 8000. For production, use a reverse proxy or environment variables.
     const port = '8000';
     // The path needs to match the backend router configuration.
-    const path = '/api/bot/chat?client_id=user123'; // Added client_id as per backend expectation
+    const path = '/api/bot/chat?client_id=amit'; // Added client_id as per backend expectation
     return `${protocol}//${host}:${port}${path}`;
 };
 

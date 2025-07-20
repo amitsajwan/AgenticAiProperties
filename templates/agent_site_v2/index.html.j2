@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ agent.name }} - Real Estate Agent</title>
+    <style>
+        :root {
+            --primary: #4361ee;
+            --secondary: #3f37c9;
+            --light: #f8f9fa;
+            --dark: #212529;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: var(--dark);
+            background-color: var(--light);
+        }
+        .navbar {
+            background-color: white;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .logo-container {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+        .logo {
+            height: 80px;
+            width: 80px;
+            border-radius: 50%;
+            object-fit: contain;
+            background-color: #f0f0f0;
+            padding: 5px;
+            border: 2px solid var(--primary);
+        }
+        .hero {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            padding: 80px 0;
+        }
+        .post-card {
+            transition: transform 0.3s;
+            border: none;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+        }
+        .post-card:hover {
+            transform: translateY(-10px);
+        }
+        .post-image {
+            height: 200px;
+            object-fit: cover;
+        }
+        footer {
+            background-color: var(--dark);
+            color: white;
+            padding: 40px 0 20px;
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg py-3">
+        <div class="container">
+            <div class="logo-container">
+                {% if agent.logo_url %}
+                <img src="{{ logo_url }}" alt="{{ agent.name }} Logo" class="logo">
+                {% endif %}
+                <h1 class="h3 mb-0">{{ agent.name }}</h1>
+            </div>
+        </div>
+    </nav>
+
+    <section class="hero text-center">
+        <div class="container">
+            <h2 class="display-4 mb-4">Your Trusted Real Estate Partner</h2>
+            <p class="lead mb-5">{{ agent.description or "Expert real estate services tailored to your needs" }}</p>
+        </div>
+    </section>
+
+    <section class="py-5">
+        <div class="container">
+            <h3 class="text-center mb-5">Latest Property Listings</h3>
+            <div class="row">
+                {% for post in posts %}
+                <div class="col-lg-4 col-md-6 mb-4">
+                    <div class="post-card card h-100">
+                        {% if post.image_path %}
+                        <img src="/generated_images/{{ post.image_path }}" class="card-img-top post-image" alt="Property image">
+                        {% endif %}
+                        <div class="card-body">
+                            <h5 class="card-title">{{ post.message[:50] }}...</h5>
+                            <p class="card-text">{{ post.created_at | datetimeformat }}</p>
+                            <a href="{{ post.url }}" target="_blank" class="btn btn-primary">View Details</a>
+                        </div>
+                    </div>
+                </div>
+                {% else %}
+                <div class="col-12 text-center">
+                    <p>No listings available yet.</p>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <div class="container">
+            <div class="row">
+                <div class="col-md-6">
+                    <div class="logo-container mb-4">
+                        {% if agent.logo_url %}
+                        <img src="{{ logo_url }}" alt="{{ agent.name }} Logo" class="logo">
+                        {% endif %}
+                        <h4>{{ agent.name }}</h4>
+                    </div>
+                    <p>{{ agent.description }}</p>
+                </div>
+                <div class="col-md-6 text-end">
+                    <p>&copy; {{ current_year }} {{ agent.name }}. All rights reserved.</p>
+                </div>
+            </div>
+        </div>
+    </footer>
+</body>
+</html>

@@ -9,8 +9,8 @@ import {
   YAxis,
   Tooltip,
   Legend,
-} from "recharts";
-import api from "@/lib/api";
+} from "recharts"; 
+import { get } from "@/lib/api";
 
 interface AnalyticsData {
   date: string;
@@ -27,18 +27,13 @@ interface InsightsChartProps {
 export default function InsightsChart({ agentId }: InsightsChartProps) {
   const [data, setData] = useState<AnalyticsData[]>([]);
 
-
-  useEffect(() => {
-  api
-    .get<AnalyticsData[]>(`/facebook/insights/agents/${agentId}?days=7`)
+useEffect(() => {
+  get<AnalyticsData[]>(`/facebook/insights/agents/${agentId}?days=7`)
     .then((res) => {
-      const validData = Array.isArray(res) ? res : [];
+      const validData = Array.isArray(res.data) ? res.data : [];
       setData(validData);
     })
-    .catch((err) => {
-      console.error("Error fetching analytics:", err);
-      setData([]);
-    });
+    .catch((err) => console.error("Failed to fetch insights", err));
 }, [agentId]);
 
 
