@@ -33,23 +33,14 @@ except Exception as e:
     logger.error(f"ChatGroq initialization failed: {e}", exc_info=True)
     llm = None
 
-# -------------------------------
-# Stability AI Image Generation
-# -------------------------------
+
 async def generate_image_with_stability(prompt: str) -> bytes:
-    """Generate image using Stability AI API"""
     api_key = settings.STABILITY_API_KEY
-    if not api_key:
-        raise ValueError("STABILITY_API_KEY is not set")
-
-    engine_id = "stable-diffusion-xl-1024-v1-0"
-    url = f"https://api.stability.ai/v1/generation/{engine_id}/text-to-image"
-
+    url = f"https://api.stability.ai/v1/generation/stable-diffusion-xl-1024-v1-0/text-to-image"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Accept": "application/json",
     }
-
     json_payload = {
         "text_prompts": [{"text": prompt, "weight": 1.0}],
         "cfg_scale": 7,
@@ -58,65 +49,72 @@ async def generate_image_with_stability(prompt: str) -> bytes:
         "samples": 1,
         "steps": 30,
     }
-
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(url, headers=headers, json=json_payload)
-        if response.status_code != 200:
-            raise Exception(f"Stability API request failed with status {response.status_code}: {response.text}")
-        data = response.json()
-
-        if data.get('artifacts') and len(data['artifacts']) > 0:
-            image_data = data['artifacts'][0]['base64']
-            return base64.b64decode(image_data)
-        else:
+        resp = await client.post(url, headers=headers, json=json_payload)
+        if resp.status_code != 200:
+            raise Exception(f"Stability API request failed ({resp.status_code}): {resp.text}")
+        data = resp.json()
+        art = data.get("artifacts")
+        if not art or not art[0].get("base64"):
             raise Exception("No image artifacts in response")
+        return base64.b64decode(art[0]["base64"])
 
-# -------------------------------
-# Logo Generation
-# -------------------------------
+
 async def generate_agent_logo(agent_id: str, logo_prompt: str, db: AsyncIOMotorDatabase) -> str:
-    """Generate professional logo using AI and return its path"""
+    """
+    Generate a logo for the agent, writing a PNG to generated_images/<agent_id>_logo.png
+    Falls back to a simple placeholder if AI calls fail or if prompt is empty.
+    """
     logo_dir = "generated_images"
     os.makedirs(logo_dir, exist_ok=True)
-    
-    # Generate refined logo prompt
-    if llm:
-        prompt_template = ChatPromptTemplate.from_messages([
-            ("system", "You're a creative branding expert. Create a professional logo prompt for a real estate agent. Focus on visual elements: house icon, key, modern, clean, vector art, minimalistic. Include the agent's name if provided."),
-            ("user", "Brand concept: {logo_prompt_input}")
-        ])
-        chain = prompt_template | llm | StrOutputParser()
-        ai_logo_prompt = await chain.ainvoke({"logo_prompt_input": logo_prompt})
-        logger.info(f"[Logo] AI Prompt generated: {ai_logo_prompt[:100]}...")
-    else:
-        ai_logo_prompt = f"Professional real estate logo: {logo_prompt}, modern, clean, vector art"
-        logger.warning("[Logo] LLM not initialized, using generic prompt.")
-
-    # Generate logo image
     logo_filename = f"{agent_id}_logo.png"
     agent_logo_path = os.path.join(logo_dir, logo_filename)
-    
+
+    # 1) Build the AI-crafted prompt
+    if llm:
+        prompt_template = ChatPromptTemplate.from_messages([
+            ("system", "You're a creative branding expert. Produce a concise vector‐art logo prompt."),
+            ("user", "Brand concept: {logo_prompt_input}")
+        ])
+        ai_logo_prompt = await (prompt_template | llm | StrOutputParser()).ainvoke({
+            "logo_prompt_input": logo_prompt
+        })
+        logger.info(f"[Logo] Raw AI prompt length: {len(ai_logo_prompt)}\n  >>> {ai_logo_prompt[:80]}...")
+    else:
+        ai_logo_prompt = f"Modern real estate logo: {logo_prompt}"
+        logger.warning("[Logo] LLM unavailable, using generic fallback prompt.")
+
+    # 2) Clean & truncate the prompt to meet Stability bounds
+    clean = " ".join(ai_logo_prompt.splitlines()).strip()
+    if not clean:
+        logger.error("[Logo] Cleaned prompt is empty—skipping Stability call.")
+    truncated = clean[:2000]
+    logger.info(f"[Logo] Using final prompt ({len(truncated)} chars): {truncated[:80]}...")
+
+    # 3) Try Stability; on failure, use placeholder
     try:
-        image_bytes = await generate_image_with_stability(ai_logo_prompt)
-        with open(agent_logo_path, "wb") as f:
-            f.write(image_bytes)
-        logger.info(f"[Logo] AI logo generated: {agent_logo_path}")
+        if clean:
+            image_bytes = await generate_image_with_stability(truncated)
+            with open(agent_logo_path, "wb") as f:
+                f.write(image_bytes)
+            logger.info(f"[Logo] AI logo generated at: {agent_logo_path}")
+        else:
+            raise Exception("Empty prompt—skipping AI image generation")
     except Exception as e:
         logger.error(f"[Logo] AI generation failed: {e}. Using placeholder", exc_info=True)
-        # Fallback placeholder
+        # Placeholder generation
         img = Image.new("RGB", (512, 512), (30, 60, 90))
         draw = ImageDraw.Draw(img)
         try:
             font = ImageFont.truetype("arial.ttf", 40)
         except IOError:
             font = ImageFont.load_default()
-        text = logo_prompt[:3].upper() if logo_prompt else "RE"
-        draw.text((150, 200), text, fill=(255, 255, 255), font=font)
+        text = (logo_prompt[:3] or agent_id[:3]).upper()
+        draw.text((180, 220), text, fill=(255, 255, 255), font=font)
         img.save(agent_logo_path)
-    
+        logger.info(f"[Logo] Placeholder logo saved at: {agent_logo_path}")
+
     return logo_filename
-
-
 
 # -------------------------------
 # State Definition (for LangGraph)

@@ -68,15 +68,17 @@ const AgentSettingsForm: React.FC<AgentSettingsFormProps> = ({ agentData, refres
   };
 
   // Helper function to determine the correct logo source URL
-  const getLogoSrc = (logoUrl?: string) => {
+  const API_ROOT = process.env.NEXT_PUBLIC_API_URL || '';
+
+  function getLogoSrc(logoUrl?: string) {
     if (!logoUrl) return '';
-    // Check if it's a full external URL (e.g., from placehold.co)
-    if (logoUrl.startsWith('http://') || logoUrl.startsWith('https://')) {
-      return logoUrl;
-    }
-    // [MODIFIED] Explicitly point to the backend's port for locally generated images
-    return `http://localhost:8000/generated_images/${logoUrl}`; 
-  };
+    // Full external URLs (CDN, placehold.co, etc.)
+    if (/^https?:\/\//.test(logoUrl)) return logoUrl;
+
+    // Serve from FastAPI static mount
+    return `${API_ROOT}/generated_images/${encodeURIComponent(logoUrl)}`;
+  }
+
 
   return (
     <Card className="w-full max-w-md mx-auto rounded-xl shadow-lg">
@@ -132,7 +134,8 @@ const AgentSettingsForm: React.FC<AgentSettingsFormProps> = ({ agentData, refres
             <div className="grid gap-2">
               <Label className="text-gray-700">Current Logo Preview</Label>
               <img 
-                src={getLogoSrc(agentData.logo_url)} 
+                src={getLogoSrc(agentData.logo_url)}
+
                 alt="Current Agent Logo" 
                 className="w-24 h-24 rounded-full object-cover border-2 border-gray-200"
               />
